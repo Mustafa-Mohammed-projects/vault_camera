@@ -1,421 +1,854 @@
+import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
-import 'package:flutter/material.dart';
+
 import 'package:camera/camera.dart';
-import 'package:permission_handler/permission_handler.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:encrypt/encrypt.dart' as enc;
+import 'package:cryptography/cryptography.dart' as cryptography;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:image/image.dart' as img;
 import 'package:local_auth/local_auth.dart';
+import 'package:path_provider/path_provider.dart';
+import 'dart:io';
 
-// متغير عام للوصول إلى كاميرات الجهاز
-List<CameraDescription> cameras = [];
+late final List<CameraDescription> appCameras;
 
-void main() async {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await SystemChrome.setPreferredOrientations([
+    DeviceOrientation.portraitUp,
+  ]);
 
-  // طلب أذونات Android 13+ والكاميرا
-  await [
-    Permission.camera,
-    Permission.photos,
-    Permission.biometrics,
-  ].request();
-
-  try {
-    cameras = await availableCameras();
-  } catch (e) {
-    debugPrint("Failed to initialize camera: $e");
-  }
-
-  runApp(const VaultApp());
+  appCameras = await availableCameras();
+  runApp(const VaultCameraApp());
 }
 
-// =============================================================================
-// 1. MODEL (نموذج بيانات الصورة المشفرة)
-// =============================================================================
-class VaultItem {
-  final String filePath;
-  final String ivBase64;
-  final DateTime createdAt;
-
-  VaultItem({
-    required this.filePath,
-    required this.ivBase64,
-    required this.createdAt,
-  });
-
-  Map<String, dynamic> toJson() => {
-        'filePath': filePath,
-        'ivBase64': ivBase64,
-        'createdAt': createdAt.toIso8601String(),
-      };
-
-  factory VaultItem.fromJson(Map<String, dynamic> json) => VaultItem(
-        filePath: json['filePath'],
-        ivBase64: json['ivBase64'],
-        createdAt: DateTime.parse(json['createdAt']),
-      );
-}
-
-// =============================================================================
-// 2. SERVICES (محرك التشفير والتخزين)
-// =============================================================================
-class EncryptionService {
-  final _secureStorage = const FlutterSecureStorage();
-  final _localAuth = LocalAuthentication();
-  static const _keyAlias = 'vault_master_key';
-
-  Future<bool> authenticate() async {
-    final canCheck = await _localAuth.canCheckBiometrics;
-    if (!canCheck) return false;
-    return await _localAuth.authenticate(
-      localizedReason: 'Authenticate to access Vault keys',
-      options: const AuthenticationOptions(biometricOnly: true),
-    );
-  }
-
-  Future<enc.Key> _getOrCreateKey() async {
-    String? base64Key = await _secureStorage.read(key: _keyAlias);
-    if (base64Key == null) {
-      final key = enc.Key.fromSecureRandom(32); // 256-bit AES Key
-      await _secureStorage.write(key: _keyAlias, value: key.base64);
-      return key;
-    }
-    return enc.Key.fromBase64(base64Key);
-  }
-
-  Future<Map<String, dynamic>> encryptImage(Uint8List imageBytes) async {
-    final key = await _getOrCreateKey();
-    final iv = enc.IV.fromSecureRandom(16);
-    final encrypter = enc.Encrypter(enc.AES(key, mode: enc.AESMode.cbc));
-    final encrypted = encrypter.encryptBytes(imageBytes, iv: iv);
-    return {
-      'encryptedBytes': encrypted.bytes,
-      'iv': iv.base64,
-    };
-  }
-
-  Future<Uint8List> decryptVaultFile(Uint8List encryptedBytes, String ivBase64) async {
-    final key = await _getOrCreateKey();
-    final iv = enc.IV.fromBase64(ivBase64);
-    final encrypter = enc.Encrypter(enc.AES(key, mode: enc.AESMode.cbc));
-    final encrypted = enc.Encrypted(encryptedBytes);
-    return Uint8List.fromList(encrypter.decryptBytes(encrypted, iv: iv));
-  }
-}
-
-class VaultStorageService {
-  final EncryptionService _encryptionService = EncryptionService();
-
-  Future<Directory> _getVaultDirectory() async {
-    final docsDir = await getApplicationDocumentsDirectory();
-    final vaultDir = Directory('${docsDir.path}/vault');
-    if (!await vaultDir.exists()) {
-      await vaultDir.create(recursive: true);
-    }
-    return vaultDir;
-  }
-
-  Future<void> saveEncryptedPhoto(Uint8List imageBytes) async {
-    final dir = await _getVaultDirectory();
-    final encryptedData = await _encryptionService.encryptImage(imageBytes);
-
-    final timestamp = DateTime.now().millisecondsSinceEpoch;
-    final photoFile = File('${dir.path}/img_$timestamp.vault');
-    final metaFile = File('${dir.path}/img_$timestamp.meta');
-
-    await photoFile.writeAsBytes(encryptedData['encryptedBytes']);
-
-    final item = VaultItem(
-      filePath: photoFile.path,
-      ivBase64: encryptedData['iv'],
-      createdAt: DateTime.now(),
-    );
-    await metaFile.writeAsString(jsonEncode(item.toJson()));
-  }
-
-  Future<List<VaultItem>> loadVaultItems() async {
-    final dir = await _getVaultDirectory();
-    final List<FileSystemEntity> files = dir.listSync();
-    List<VaultItem> items = [];
-
-    for (var file in files) {
-      if (file.path.endsWith('.meta')) {
-        final content = await File(file.path).readAsString();
-        items.add(VaultItem.fromJson(jsonDecode(content)));
-      }
-    }
-    items.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-    return items;
-  }
-
-  Future<Uint8List> decryptItem(VaultItem item) async {
-    final encryptedBytes = await File(item.filePath).readAsBytes();
-    return await _encryptionService.decryptVaultFile(encryptedBytes, item.ivBase64);
-  }
-}
-
-// =============================================================================
-// 3. UI SCREENS & WIDGETS (الشاشات وواجهة المستخدم)
-// =============================================================================
-class VaultApp extends StatelessWidget {
-  const VaultApp({Key? key}) : super(key: key);
+class VaultCameraApp extends StatelessWidget {
+  const VaultCameraApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Vault Camera',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark(useMaterial3: true),
-      home: const MainNavigationScreen(),
+      theme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.dark,
+        colorSchemeSeed: Colors.indigo,
+      ),
+      home: const UnlockScreen(),
     );
   }
 }
 
-class MainNavigationScreen extends StatefulWidget {
-  const MainNavigationScreen({Key? key}) : super(key: key);
+// ---------------------------------------------------------------------------
+// Security
+// ---------------------------------------------------------------------------
 
-  @override
-  _MainNavigationScreenState createState() => _MainNavigationScreenState();
+class SecureAuth {
+  final LocalAuthentication auth = LocalAuthentication();
+
+  Future<bool> authenticate() async {
+    try {
+      if (!await auth.isDeviceSupported()) return false;
+      return await auth.authenticate(
+        localizedReason: 'Authenticate to unlock Vault Camera',
+        options: const AuthenticationOptions(
+          biometricOnly: false,
+          sensitiveTransaction: true,
+          useErrorDialogs: true,
+          stickyAuth: true,
+        ),
+      );
+    } catch (_) {
+      return false;
+    }
+  }
 }
 
-class _MainNavigationScreenState extends State<MainNavigationScreen> {
-  int _currentIndex = 0;
+class KeyManager {
+  static const keyName = 'vault.master.v2';
+
+  final SecureAuth auth;
+  final FlutterSecureStorage storage = const FlutterSecureStorage(
+    aOptions: AndroidOptions(resetOnError: true),
+  );
+
+  KeyManager(this.auth);
+
+  Future<Uint8List?> unlock() async {
+    if (!await auth.authenticate()) return null;
+
+    final existing = await storage.read(key: keyName);
+    if (existing != null) {
+      final bytes = base64Url.decode(existing);
+      if (bytes.length != 32) {
+        await storage.delete(key: keyName);
+        throw StateError('Invalid master key.');
+      }
+      return Uint8List.fromList(bytes);
+    }
+
+    final key = Uint8List.fromList(
+      List<int>.generate(
+        32,
+        (_) => Random.secure().nextInt(256),
+      ),
+    );
+
+    await storage.write(
+      key: keyName,
+      value: base64UrlEncode(key),
+    );
+
+    return key;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Vault format
+//
+// Magic: "VLT01" (5)
+// Version: 1 byte
+// Algorithm: 1 byte (1 = AES-256-CBC + HMAC-SHA256)
+// IV length: 1 byte
+// IV: 16
+// Ciphertext: variable
+// HMAC: 32
+//
+// HMAC covers header + ciphertext.
+// The same 32-byte master key is used by the requested encrypt package.
+// For a future native cryptographic backend, derive independent ENC/MAC keys
+// with HKDF and keep the file version so migration remains possible.
+// ---------------------------------------------------------------------------
+
+class VaultCrypto {
+  static const magic = [0x56, 0x4c, 0x54, 0x30, 0x32]; // VLT02
+  static const version = 2;
+  static const algorithm = 2; // AES-256-GCM
+  static const nonceLength = 12;
+  static const tagLength = 16;
+
+  final cryptography.AesGcm _aes =
+      cryptography.AesGcm.with256bits();
+
+  Future<Uint8List> encrypt(
+    Uint8List plaintext,
+    Uint8List rawKey,
+  ) async {
+    final secretKey = cryptography.SecretKey(rawKey);
+    final nonce = _aes.newNonce();
+
+    final aad = Uint8List.fromList([
+      ...magic,
+      version,
+      algorithm,
+      nonceLength,
+    ]);
+
+    final box = await _aes.encrypt(
+      plaintext,
+      secretKey: secretKey,
+      nonce: nonce,
+      aad: aad,
+    );
+
+    return Uint8List.fromList(
+      BytesBuilder(copy: false)
+        ..add(aad)
+        ..add(box.nonce)
+        ..add(box.cipherText)
+        ..add(box.mac.bytes)
+        .toBytes(),
+    );
+  }
+
+  Future<Uint8List> decrypt(
+    Uint8List payload,
+    Uint8List rawKey,
+  ) async {
+    const minimum = 8 + nonceLength + tagLength + 1;
+    if (payload.length < minimum) {
+      throw const FormatException('Vault payload too small.');
+    }
+
+    for (var i = 0; i < magic.length; i++) {
+      if (payload[i] != magic[i]) {
+        throw const FormatException('Invalid vault magic.');
+      }
+    }
+
+    if (payload[5] != version ||
+        payload[6] != algorithm ||
+        payload[7] != nonceLength) {
+      throw const FormatException('Unsupported vault format.');
+    }
+
+    final headerLength = 8;
+    final cipherEnd = payload.length - tagLength;
+    if (cipherEnd <= headerLength + nonceLength) {
+      throw const FormatException('Invalid ciphertext.');
+    }
+
+    final aad = payload.sublist(0, headerLength);
+    final nonce = payload.sublist(
+      headerLength,
+      headerLength + nonceLength,
+    );
+    final ciphertext = payload.sublist(
+      headerLength + nonceLength,
+      cipherEnd,
+    );
+    final tag = payload.sublist(cipherEnd);
+
+    try {
+      final box = cryptography.SecretBox(
+        ciphertext,
+        nonce: nonce,
+        mac: cryptography.Mac(tag),
+      );
+
+      return Uint8List.fromList(
+        await _aes.decrypt(
+          box,
+          secretKey: cryptography.SecretKey(rawKey),
+          aad: aad,
+        ),
+      );
+    } on cryptography.SecretBoxAuthenticationError {
+      throw const FormatException('Authentication failed.');
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Storage
+// ---------------------------------------------------------------------------
+
+class VaultItem {
+  final String id;
+  final File file;
+  final DateTime createdAt;
+
+  const VaultItem({
+    required this.id,
+    required this.file,
+    required this.createdAt,
+  });
+}
+
+class VaultStorage {
+  Future<Directory> directory() async {
+    final base = await getApplicationDocumentsDirectory();
+    final dir = Directory('${base.path}/vault');
+    if (!await dir.exists()) await dir.create(recursive: true);
+    return dir;
+  }
+
+  Future<void> save(String id, Uint8List payload, DateTime created) async {
+    final dir = await directory();
+    final file = File('${dir.path}/$id.vault');
+    final meta = File('${dir.path}/$id.meta');
+
+    await file.writeAsBytes(payload, flush: true);
+    await meta.writeAsString(
+      jsonEncode({
+        'version': 1,
+        'createdAt': created.toUtc().toIso8601String(),
+      }),
+      flush: true,
+    );
+  }
+
+  Future<List<VaultItem>> list() async {
+    final dir = await directory();
+    final result = <VaultItem>[];
+
+    await for (final e in dir.list()) {
+      if (e is! File || !e.path.endsWith('.vault')) continue;
+      final id = e.uri.pathSegments.last.replaceFirst('.vault', '');
+      final meta = File('${dir.path}/$id.meta');
+      if (!await meta.exists()) continue;
+
+      try {
+        final m = jsonDecode(await meta.readAsString());
+        result.add(VaultItem(
+          id: id,
+          file: e,
+          createdAt: DateTime.parse(m['createdAt'] as String),
+        ));
+      } catch (_) {}
+    }
+
+    result.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return result;
+  }
+
+  Future<Uint8List> read(VaultItem item) async {
+    return Uint8List.fromList(await item.file.readAsBytes());
+  }
+
+  Future<void> delete(VaultItem item) async {
+    final meta = File(item.file.path.replaceFirst('.vault', '.meta'));
+    if (await item.file.exists()) await item.file.delete();
+    if (await meta.exists()) await meta.delete();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Camera memory pipeline
+// ---------------------------------------------------------------------------
+
+class MemoryCameraEncoder {
+  static Uint8List yuv420ToJpeg(CameraImage image, {int quality = 90}) {
+    if (image.format.group != ImageFormatGroup.yuv420) {
+      throw UnsupportedError(
+        'This strict memory pipeline expects YUV420.',
+      );
+    }
+
+    final width = image.width;
+    final height = image.height;
+    final out = img.Image(width: width, height: height);
+
+    final yPlane = image.planes[0];
+    final uPlane = image.planes[1];
+    final vPlane = image.planes[2];
+
+    final yBytes = yPlane.bytes;
+    final uBytes = uPlane.bytes;
+    final vBytes = vPlane.bytes;
+
+    final yRowStride = yPlane.bytesPerRow;
+    final uRowStride = uPlane.bytesPerRow;
+    final vRowStride = vPlane.bytesPerRow;
+    final uPixelStride = uPlane.bytesPerPixel ?? 1;
+    final vPixelStride = vPlane.bytesPerPixel ?? 1;
+
+    for (var y = 0; y < height; y++) {
+      for (var x = 0; x < width; x++) {
+        final yValue = yBytes[y * yRowStride + x];
+
+        final uvX = x ~/ 2;
+        final uvY = y ~/ 2;
+
+        final uIndex = uvY * uRowStride + uvX * uPixelStride;
+        final vIndex = uvY * vRowStride + uvX * vPixelStride;
+
+        final u = uBytes[uIndex];
+        final v = vBytes[vIndex];
+
+        final r = (yValue + 1.402 * (v - 128)).round().clamp(0, 255);
+        final g = (yValue - 0.344136 * (u - 128) -
+                0.714136 * (v - 128))
+            .round()
+            .clamp(0, 255);
+        final b = (yValue + 1.772 * (u - 128)).round().clamp(0, 255);
+
+        out.setPixelRgb(x, y, r, g, b);
+      }
+    }
+
+    return Uint8List.fromList(img.encodeJpg(out, quality: quality));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Vault controller
+// ---------------------------------------------------------------------------
+
+class VaultController {
+  final KeyManager keyManager;
+  final VaultCrypto crypto;
+  final VaultStorage storage;
+
+  Uint8List? _key;
+
+  VaultController(this.keyManager, this.crypto, this.storage);
+
+  bool get unlocked => _key != null;
+
+  Future<bool> unlock() async {
+    _key = await keyManager.unlock();
+    return _key != null;
+  }
+
+  void lock() {
+    _key = null;
+  }
+
+  Future<void> store(Uint8List jpegBytes) async {
+    final key = _key;
+    if (key == null) throw StateError('Vault locked.');
+
+    final payload = await crypto.encrypt(jpegBytes, key);
+    final random = Random.secure();
+    final id = List<int>.generate(16, (_) => random.nextInt(256))
+        .map((e) => e.toRadixString(16).padLeft(2, '0'))
+        .join();
+
+    await storage.save(id, payload, DateTime.now().toUtc());
+  }
+
+  Future<Uint8List> decrypt(VaultItem item) async {
+    final key = _key;
+    if (key == null) throw StateError('Vault locked.');
+    return crypto.decrypt(await storage.read(item), key);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Unlock screen
+// ---------------------------------------------------------------------------
+
+class UnlockScreen extends StatefulWidget {
+  const UnlockScreen({super.key});
+
+  @override
+  State<UnlockScreen> createState() => _UnlockScreenState();
+}
+
+class _UnlockScreenState extends State<UnlockScreen> {
+  late final VaultController vault;
+  bool busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final auth = SecureAuth();
+    vault = VaultController(
+      KeyManager(auth),
+      VaultCrypto(),
+      VaultStorage(),
+    );
+  }
+
+  Future<void> unlock() async {
+    if (busy) return;
+    setState(() => busy = true);
+
+    final ok = await vault.unlock();
+
+    if (!mounted) return;
+    setState(() => busy = false);
+
+    if (!ok) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Authentication failed.')),
+      );
+      return;
+    }
+
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (_) => CameraScreen(vault: vault),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    final pages = [
-      cameras.isNotEmpty
-          ? CameraScreen(cameras: cameras)
-          : const Center(child: Text("لا توجد كاميرا متوفرة")),
-      const GalleryScreen(),
-    ];
-
     return Scaffold(
-      body: pages[_currentIndex],
-      bottomNavigationBar: BottomNavigationBar(
-        currentIndex: _currentIndex,
-        backgroundColor: Colors.black,
-        selectedItemColor: Colors.amber,
-        unselectedItemColor: Colors.white54,
-        onTap: (index) => setState(() => _currentIndex = index),
-        items: const [
-          BottomNavigationBarItem(icon: Icon(Icons.camera_alt), label: 'الكاميرا'),
-          BottomNavigationBarItem(icon: Icon(Icons.photo_library), label: 'المعرض المشفر'),
-        ],
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.shield, size: 96),
+            const SizedBox(height: 24),
+            const Text(
+              'Vault Camera',
+              style: TextStyle(fontSize: 30, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 12),
+            const Text('Memory-first encrypted photography'),
+            const SizedBox(height: 36),
+            FilledButton.icon(
+              onPressed: busy ? null : unlock,
+              icon: const Icon(Icons.fingerprint),
+              label: const Text('Unlock'),
+            ),
+          ],
+        ),
       ),
     );
   }
 }
 
+// ---------------------------------------------------------------------------
+// Camera
+// ---------------------------------------------------------------------------
+
 class CameraScreen extends StatefulWidget {
-  final List<CameraDescription> cameras;
-  const CameraScreen({Key? key, required this.cameras}) : super(key: key);
+  final VaultController vault;
+
+  const CameraScreen({super.key, required this.vault});
 
   @override
-  _CameraScreenState createState() => _CameraScreenState();
+  State<CameraScreen> createState() => _CameraScreenState();
 }
 
-class _CameraScreenState extends State<CameraScreen> {
-  late CameraController _controller;
-  final VaultStorageService _storageService = VaultStorageService();
-  bool _isCapturing = false;
+class _CameraScreenState extends State<CameraScreen>
+    with WidgetsBindingObserver {
+  CameraController? controller;
+  bool streaming = false;
+  bool processing = false;
+  bool switching = false;
+  int cameraIndex = 0;
+  DateTime lastCapture = DateTime.fromMillisecondsSinceEpoch(0);
 
   @override
   void initState() {
     super.initState();
-    _controller = CameraController(widget.cameras[0], ResolutionPreset.max);
-    _controller.initialize().then((_) {
-      if (!mounted) return;
-      setState(() {});
-    });
+    WidgetsBinding.instance.addObserver(this);
+    _initCamera();
   }
 
-  Future<void> _captureAndEncrypt() async {
-    if (_isCapturing) return;
-    setState(() => _isCapturing = true);
+  Future<void> _initCamera() async {
+    if (appCameras.isEmpty) return;
+
+    controller?.dispose();
+
+    final c = CameraController(
+      appCameras[cameraIndex],
+      ResolutionPreset.high,
+      enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.yuv420,
+    );
+
+    controller = c;
 
     try {
-      final XFile photo = await _controller.takePicture();
-      final bytes = await photo.readAsBytes();
+      await c.initialize();
+      await c.setFlashMode(FlashMode.off);
 
-      // التشفير والحفظ المباشر
-      await _storageService.saveEncryptedPhoto(bytes);
-
-      // مسح الكاش المؤقت للكاميرا فوراً
-      final rawFile = File(photo.path);
-      if (await rawFile.exists()) {
-        await rawFile.delete();
-      }
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('تم التشفير والحفظ بنجاح!')),
-      );
+      if (mounted) setState(() {});
     } catch (e) {
-      debugPrint("Capture error: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Camera error: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> capture() async {
+    final c = controller;
+    if (c == null ||
+        !c.value.isInitialized ||
+        processing ||
+        streaming) {
+      return;
+    }
+
+    setState(() => streaming = true);
+
+    try {
+      await c.startImageStream((frame) {
+        if (processing) return;
+
+        final now = DateTime.now();
+        if (now.difference(lastCapture) <
+            const Duration(milliseconds: 350)) {
+          return;
+        }
+
+        processing = true;
+        lastCapture = now;
+
+        _processFrame(frame);
+      });
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Capture stream failed: $e')),
+        );
+      }
+      setState(() => streaming = false);
+    }
+  }
+
+  Future<void> _processFrame(CameraImage frame) async {
+    try {
+      final jpeg = MemoryCameraEncoder.yuv420ToJpeg(frame);
+
+      await widget.vault.store(jpeg);
+
+      // Best-effort overwrite of the Dart buffer before dropping it.
+      jpeg.fillRange(0, jpeg.length, 0);
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Encrypted photo saved.'),
+            duration: Duration(milliseconds: 700),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Encryption failed: $e')),
+        );
+      }
     } finally {
-      setState(() => _isCapturing = false);
+      processing = false;
+      final c = controller;
+      if (c != null && c.value.isStreamingImages) {
+        await c.stopImageStream();
+      }
+      if (mounted) setState(() => streaming = false);
+    }
+  }
+
+  Future<void> switchCamera() async {
+    if (switching || appCameras.length < 2) return;
+    switching = true;
+
+    cameraIndex = (cameraIndex + 1) % appCameras.length;
+    await _initCamera();
+
+    switching = false;
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      widget.vault.lock();
+      controller?.dispose();
+      controller = null;
+      streaming = false;
     }
   }
 
   @override
   void dispose() {
-    _controller.dispose();
+    WidgetsBinding.instance.removeObserver(this);
+    controller?.dispose();
+    widget.vault.lock();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    if (!_controller.value.isInitialized) {
-      return const Center(child: CircularProgressIndicator());
-    }
+    final c = controller;
 
     return Scaffold(
       backgroundColor: Colors.black,
-      body: Stack(
-        children: [
-          Positioned.fill(
-            child: AspectRatio(
-              aspectRatio: 16 / 9,
-              child: CameraPreview(_controller),
+      body: c == null || !c.value.isInitialized
+          ? const Center(child: CircularProgressIndicator())
+          : Stack(
+              fit: StackFit.expand,
+              children: [
+                CameraPreview(c),
+                SafeArea(
+                  child: Column(
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          IconButton(
+                            icon: const Icon(Icons.lock_outline),
+                            onPressed: () {
+                              widget.vault.lock();
+                              Navigator.of(context).pushAndRemoveUntil(
+                                MaterialPageRoute(
+                                  builder: (_) => const UnlockScreen(),
+                                ),
+                                (_) => false,
+                              );
+                            },
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.flip_camera_android),
+                            onPressed: switchCamera,
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.photo_library_outlined),
+                            onPressed: () {
+                              Navigator.of(context).push(
+                                MaterialPageRoute(
+                                  builder: (_) =>
+                                      GalleryScreen(vault: widget.vault),
+                                ),
+                              );
+                            },
+                          ),
+                        ],
+                      ),
+                      const Spacer(),
+                      GestureDetector(
+                        onTap: capture,
+                        child: Container(
+                          width: 82,
+                          height: 82,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: Colors.white,
+                              width: 5,
+                            ),
+                          ),
+                          child: Center(
+                            child: Container(
+                              width: 64,
+                              height: 64,
+                              decoration: const BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 35),
+                    ],
+                  ),
+                ),
+              ],
             ),
-          ),
-          Align(
-            alignment: Alignment.bottomCenter,
-            child: Padding(
-              padding: const EdgeInsets.only(bottom: 40),
-              child: FloatingActionButton(
-                backgroundColor: _isCapturing ? Colors.grey : Colors.white,
-                onPressed: _captureAndEncrypt,
-                child: const Icon(Icons.camera, color: Colors.black, size: 30),
-              ),
-            ),
-          )
-        ],
-      ),
     );
   }
 }
 
+// ---------------------------------------------------------------------------
+// Gallery
+// ---------------------------------------------------------------------------
+
 class GalleryScreen extends StatefulWidget {
-  const GalleryScreen({Key? key}) : super(key: key);
+  final VaultController vault;
+
+  const GalleryScreen({super.key, required this.vault});
 
   @override
-  _GalleryScreenState createState() => _GalleryScreenState();
+  State<GalleryScreen> createState() => _GalleryScreenState();
 }
 
 class _GalleryScreenState extends State<GalleryScreen> {
-  final VaultStorageService _storageService = VaultStorageService();
-  late Future<List<VaultItem>> _vaultItemsFuture;
+  List<VaultItem> items = [];
+  bool loading = true;
 
   @override
   void initState() {
     super.initState();
-    _vaultItemsFuture = _storageService.loadVaultItems();
+    load();
+  }
+
+  Future<void> load() async {
+    final data = await widget.vault.storage.list();
+    if (!mounted) return;
+    setState(() {
+      items = data;
+      loading = false;
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('المعرض المشفر'),
-        backgroundColor: Colors.black,
-      ),
-      backgroundColor: Colors.black,
-      body: FutureBuilder<List<VaultItem>>(
-        future: _vaultItemsFuture,
-        builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.waiting) {
-            return const Center(child: CircularProgressIndicator());
-          }
-          if (!snapshot.hasData || snapshot.data!.isEmpty) {
-            return const Center(
-              child: Text('لا توجد صور مشفرة محفوطة.', style: TextStyle(color: Colors.white54)),
-            );
-          }
-
-          final items = snapshot.data!;
-          return GridView.builder(
-            padding: const EdgeInsets.all(8),
-            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: 3,
-              crossAxisSpacing: 8,
-              mainAxisSpacing: 8,
-            ),
-            itemCount: items.length,
-            itemBuilder: (context, index) {
-              return VaultGridItem(
-                item: items[index],
-                storageService: _storageService,
+        title: const Text('Encrypted Vault'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.lock),
+            onPressed: () {
+              widget.vault.lock();
+              Navigator.of(context).pushAndRemoveUntil(
+                MaterialPageRoute(builder: (_) => const UnlockScreen()),
+                (_) => false,
               );
             },
-          );
-        },
-      ),
-    );
-  }
-}
-
-class VaultGridItem extends StatelessWidget {
-  final VaultItem item;
-  final VaultStorageService storageService;
-
-  const VaultGridItem({
-    Key? key,
-    required this.item,
-    required this.storageService,
-  }) : super(key: key);
-
-  @override
-  Widget build(BuildContext context) {
-    return FutureBuilder<Uint8List>(
-      future: storageService.decryptItem(item),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return Container(color: Colors.grey[900], child: const Icon(Icons.lock, color: Colors.white24));
-        }
-        if (snapshot.hasError || !snapshot.hasData) {
-          return Container(color: Colors.red[900], child: const Icon(Icons.error));
-        }
-
-        return GestureDetector(
-          onTap: () {
-            Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (_) => PhotoViewScreen(imageBytes: snapshot.data!),
-              ),
-            );
-          },
-          child: Image.memory(
-            snapshot.data!,
-            fit: BoxFit.cover,
           ),
-        );
-      },
+        ],
+      ),
+      body: loading
+          ? const Center(child: CircularProgressIndicator())
+          : items.isEmpty
+              ? const Center(child: Text('Vault is empty'))
+              : GridView.builder(
+                  padding: const EdgeInsets.all(3),
+                  gridDelegate:
+                      const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 3,
+                    crossAxisSpacing: 3,
+                    mainAxisSpacing: 3,
+                  ),
+                  itemCount: items.length,
+                  itemBuilder: (_, index) {
+                    final item = items[index];
+
+                    return FutureBuilder<Uint8List>(
+                      future: widget.vault.decrypt(item),
+                      builder: (_, snap) {
+                        if (!snap.hasData) {
+                          return const Center(
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          );
+                        }
+
+                        return GestureDetector(
+                          onTap: () {
+                            Navigator.of(context).push(
+                              MaterialPageRoute(
+                                builder: (_) => PhotoViewer(
+                                  vault: widget.vault,
+                                  item: item,
+                                ),
+                              ),
+                            );
+                          },
+                          child: Image.memory(
+                            snap.data!,
+                            fit: BoxFit.cover,
+                          ),
+                        );
+                      },
+                    );
+                  },
+                ),
     );
   }
 }
 
-class PhotoViewScreen extends StatelessWidget {
-  final Uint8List imageBytes;
+class PhotoViewer extends StatelessWidget {
+  final VaultController vault;
+  final VaultItem item;
 
-  const PhotoViewScreen({Key? key, required this.imageBytes}) : super(key: key);
+  const PhotoViewer({
+    super.key,
+    required this.vault,
+    required this.item,
+  });
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        iconTheme: const IconThemeData(color: Colors.white),
+        backgroundColor: Colors.black,
+        title: const Text('Protected View'),
       ),
-      body: Center(
-        child: InteractiveViewer(
-          child: Image.memory(imageBytes),
-        ),
+      body: FutureBuilder<Uint8List>(
+        future: vault.decrypt(item),
+        builder: (_, snap) {
+          if (!snap.hasData) {
+            return const Center(child: CircularProgressIndicator());
+          }
+
+          return InteractiveViewer(
+            minScale: 0.5,
+            maxScale: 6,
+            child: Center(
+              child: Image.memory(
+                snap.data!,
+                fit: BoxFit.contain,
+              ),
+            ),
+          );
+        },
       ),
     );
   }
