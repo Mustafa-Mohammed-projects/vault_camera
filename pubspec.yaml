@@ -1,0 +1,25 @@
+name: vault_camera
+description: A high-security zero-trust camera that stores photos encrypted in memory only.
+publish_to: 'none'
+version: 1.0.0+1
+environment:
+  sdk: '>=2.18.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  camera: ^0.10.0+4
+  path_provider: ^2.0.14
+  encrypt: ^5.0.1
+  flutter_secure_storage: ^8.0.0
+  local_auth: ^2.1.6
+
+  # UI
+  cupertino_icons: ^1.0.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
